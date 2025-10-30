@@ -6,7 +6,6 @@ const decodeBase64 = (value: string): string => {
   return Buffer.from(value, "base64").toString("utf-8");
 };
 
-// Decode CLIENT_ID and CLIENT_SECRET for use in the application
 const DECODED_CLIENT_ID = decodeBase64(CLIENT_ID);
 const DECODED_CLIENT_SECRET = decodeBase64(CLIENT_SECRET);
 import { mkdirSync, accessSync, constants, existsSync, unlinkSync } from "fs";
@@ -15,15 +14,12 @@ import { dirname } from "path";
 // Function to ensure database path exists and is read/writable
 function ensureDatabasePath(dbPath: string): void {
   try {
-    // Get the directory part of the path
     const dir = dbPath.includes("/") ? dirname(dbPath) : ".";
 
-    // If directory is not current directory, ensure it exists
     if (dir !== ".") {
       mkdirSync(dir, { recursive: true });
     }
 
-    // If database file already exists, check read/write permissions
     if (existsSync(dbPath)) {
       try {
         accessSync(dbPath, constants.R_OK | constants.W_OK);
@@ -32,14 +28,10 @@ function ensureDatabasePath(dbPath: string): void {
           `Database file ${dbPath} is not readable/writable: ${error}`
         );
       }
-    }
-    // If database file doesn't exist, check if we can write to the directory
-    else {
+    } else {
       try {
-        // Try to create and delete a temporary file to test write permissions
         const testPath = dir !== "." ? `${dir}/.dbtest.tmp` : ".dbtest.tmp";
         Bun.write(testPath, "");
-        // Delete the test file using fs.unlinkSync
         unlinkSync(testPath);
       } catch (error) {
         throw new Error(`Cannot write to database directory: ${error}`);
@@ -99,7 +91,6 @@ function getCurrentToken(): TokenData | null {
     const result = getTokenStmt.get();
     if (result && typeof result === "object" && "value" in result) {
       const tokenData = JSON.parse(result.value as string);
-      // Validate token structure
       if (
         tokenData &&
         typeof tokenData === "object" &&
@@ -124,8 +115,7 @@ function saveToken(token: TokenData) {
 }
 
 // Function to get API key
-async function getApiKey(accessToken: string): Promise<string | null> {
-  // Check if we have a cached API key
+async function getApiKey(accessToken: string): Promise<string> {
   const storedApiKey = getStoredApiKey();
   if (storedApiKey) {
     return storedApiKey;
@@ -134,13 +124,24 @@ async function getApiKey(accessToken: string): Promise<string | null> {
   const response = await fetch(
     `https://${WATERFALL_HOSTNAME}/api/oauth/getUserInfo?accessToken=${accessToken}`
   );
-  const data = await response.json();
-  const apiKey = data.data.apiKey as string;
-  if (!apiKey) {
-    return null;
+
+  if (!response.ok) {
+    throw new Error("API Not Available");
   }
 
-  // Cache the API key
+  const data = await response.json();
+
+  if (data && typeof data === "object" && !data.success) {
+    const errorMessage = data.message || "API Error";
+    const errorCode = data.code || "UNKNOWN_ERROR";
+    throw new Error(`[${errorCode}] ${errorMessage}`);
+  }
+
+  const apiKey = data.data?.apiKey as string;
+  if (!apiKey) {
+    throw new Error("API key not found in response");
+  }
+
   saveApiKey(apiKey);
   return apiKey;
 }
@@ -162,6 +163,13 @@ function clearStoredApiKey() {
   db.run(`DELETE FROM kv WHERE key = 'apiKey'`);
 }
 
+// Function to clear all stored authentication data
+function clearAuthData() {
+  db.run(`DELETE FROM kv WHERE key = 'token'`);
+  db.run(`DELETE FROM kv WHERE key = 'apiKey'`);
+  isAuthenticated = false;
+}
+
 // Function to save API key
 function saveApiKey(apiKey: string) {
   saveTokenStmt.run("apiKey", apiKey);
@@ -172,47 +180,92 @@ async function refreshToken() {
   const currentToken = getCurrentToken();
   if (!currentToken) return;
 
-  const response = await fetch(`https://${WATERFALL_HOSTNAME}/oauth/token`, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Authorization: `Basic ${Buffer.from(
-        `${DECODED_CLIENT_ID}:${DECODED_CLIENT_SECRET}`
-      ).toString("base64")}`,
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: currentToken.refresh_token,
-      client_id: DECODED_CLIENT_ID,
-      client_secret: DECODED_CLIENT_SECRET,
-    }).toString(),
-  });
+  try {
+    const response = await fetch(`https://${WATERFALL_HOSTNAME}/oauth/token`, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${Buffer.from(
+          `${DECODED_CLIENT_ID}:${DECODED_CLIENT_SECRET}`
+        ).toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: currentToken.refresh_token,
+        client_id: DECODED_CLIENT_ID,
+        client_secret: DECODED_CLIENT_SECRET,
+      }).toString(),
+    });
 
-  const data = await response.json();
-  const newToken: TokenData = {
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-    expiry_date: Date.now() + data.expires_in * 1000,
-    token_type: data.token_type,
-    scope: data.scope,
-  };
+    const data = await response.json();
 
-  saveToken(newToken);
+    if (data && typeof data === "object" && "status" in data) {
+      console.log(
+        `Token refresh failed with status ${data.status}: ${
+          data.msg || "Token rejected"
+        }`
+      );
+      clearAuthData();
+      return;
+    }
+
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+    }
+
+    if (!data.access_token || !data.refresh_token || !data.expires_in) {
+      throw new Error("Invalid token response: missing required fields");
+    }
+
+    const newToken: TokenData = {
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expiry_date: Date.now() + data.expires_in * 1000,
+      token_type: data.token_type,
+      scope: data.scope,
+    };
+
+    saveToken(newToken);
+  } catch (error) {
+    if (error instanceof TypeError && error.message.includes("fetch")) {
+      console.log("Network error during token refresh:", error.message);
+      throw error;
+    } else if (error instanceof Error) {
+      console.log("Error during token refresh:", error.message);
+      throw error;
+    } else {
+      console.log("Unknown error during token refresh:", error);
+      throw new Error("Unknown error during token refresh");
+    }
+  }
 }
 
 // Function to check and validate existing token on startup
 async function checkExistingToken() {
   const currentToken = getCurrentToken();
   if (currentToken) {
-    try {
-      // Try to refresh the token to validate it
-      await refreshToken();
-      // If refresh succeeds, the token is valid
+    if (Date.now() < currentToken.expiry_date) {
       isAuthenticated = true;
-      console.log("Existing token validated, user is authenticated");
-    } catch (error) {
-      console.log("Existing token is invalid, user needs to re-authenticate");
-      // Token is invalid, keep isAuthenticated as false
+      console.log("Existing token is valid, user is authenticated");
+
+      if (Date.now() > currentToken.expiry_date - 5 * 60 * 60 * 1000) {
+        try {
+          await refreshToken();
+          console.log("Token was refreshed successfully");
+        } catch (error) {
+          console.log(
+            "Token refresh failed, but user remains authenticated with existing token"
+          );
+        }
+      }
+    } else {
+      try {
+        await refreshToken();
+        isAuthenticated = true;
+        console.log("Expired token was refreshed, user is authenticated");
+      } catch (error) {
+        console.log("Token refresh failed, user needs to re-authenticate");
+      }
     }
   }
 }
@@ -227,10 +280,14 @@ setInterval(async () => {
     currentToken &&
     Date.now() > currentToken.expiry_date - 5 * 60 * 60 * 1000
   ) {
-    // Refresh 5 hours before expiry
-    await refreshToken();
+    try {
+      await refreshToken();
+      console.log("Token refreshed automatically");
+    } catch (error) {
+      console.error("Automatic token refresh failed:", error);
+    }
   }
-}, 60 * 60 * 1000); // Check every hour
+}, 60 * 60 * 1000);
 
 let PORT = parseInt(process.env.PORT || "34007");
 if (isNaN(PORT)) {
@@ -373,7 +430,6 @@ async function handleRoot(): Promise<Response> {
           </form>
         </div>
         <script>
-          // Handle logout form submission
           document.querySelector('form').addEventListener('submit', function(e) {
             if (!confirm('您确定要退出登录吗？')) {
               e.preventDefault();
@@ -393,7 +449,6 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
   const code = url.searchParams.get("code");
   const state = url.searchParams.get("state");
 
-  // Validate state parameter to prevent CSRF attacks
   if (!state || !PENDING_STATE || state !== PENDING_STATE) {
     return new Response("Invalid state parameter", { status: 400 });
   }
@@ -491,12 +546,6 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
           <p>您已成功认证！现在可以关闭此窗口并使用 API。</p>
           <a href="/" class="redirect-btn">返回主页</a>
         </div>
-        <script>
-          // Auto redirect after 3 seconds
-          setTimeout(function() {
-            window.location.href = "/";
-          }, 3000);
-        </script>
       </body>
       </html>
       `,
@@ -510,14 +559,8 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
 // Function to handle logout
 async function handleLogout(): Promise<Response> {
   try {
-    // Clear token from database
-    db.run(`DELETE FROM kv WHERE key = 'token'`);
-    db.run(`DELETE FROM kv WHERE key = 'apiKey'`);
+    clearAuthData();
 
-    // Update authentication status
-    isAuthenticated = false;
-
-    // Redirect to homepage
     return new Response(null, {
       status: 302,
       headers: {
@@ -547,7 +590,6 @@ async function handleModelsList(): Promise<Response> {
       return new Response("Failed to fetch models", { status: 500 });
     }
 
-    // Flatten all models from different categories
     const allModels = [];
     for (const category in data.data) {
       if (Array.isArray(data.data[category])) {
@@ -555,20 +597,17 @@ async function handleModelsList(): Promise<Response> {
       }
     }
 
-    // Convert to OpenAI compatible format
     const openaiModels = allModels
       .filter((model) => model.isVisible)
       .map((model) => {
         const created = new Date(model.updatedTime).getTime() / 1000;
 
-        // Extract contextLength from modelTags
         let contextLength = null;
         try {
           const modelTags = JSON.parse(model.modelTags);
           if (Array.isArray(modelTags) && modelTags.length > 0) {
             const seqLengthStr = modelTags[0].modelSeqLength;
             if (seqLengthStr) {
-              // Convert strings like "128K" to numbers
               const match = seqLengthStr.match(/^(\d+)(K?)$/);
               if (match) {
                 contextLength =
@@ -576,9 +615,7 @@ async function handleModelsList(): Promise<Response> {
               }
             }
           }
-        } catch (e) {
-          // Ignore parsing errors
-        }
+        } catch (e) {}
 
         return {
           id: model.modelName.trim(),
@@ -624,76 +661,71 @@ async function handleApiProxy(
   }
 
   try {
-    // Handle request body for potential retries
     let body: BodyInit | null = null;
-    let chunks: Uint8Array[] | null = null; // Hold chunks only when needed
-    let chunksComplete = false; // Track if all chunks have been recorded
-    let pumpError: Error | null = null; // Track if pump encountered an error
+    let chunks: Uint8Array[] | null = null;
+    let chunksComplete = false;
+    let pumpError: Error | null = null;
 
     if (req.method !== "GET" && req.method !== "HEAD" && req.body) {
       if (bodyBuffer) {
-        // Use buffered body for retries
         body = bodyBuffer;
       } else {
-        // Create a TransformStream to both forward the stream and optionally buffer it
         const { readable, writable } = new TransformStream();
         const writer = writable.getWriter();
 
-        // Only store chunks if we might need to retry (non-GET/HEAD requests)
         chunks = [];
 
-        // Tee the request body to both forward to the target and optionally buffer for potential retry
         const reader = req.body.getReader();
 
-        // Read the stream and write to both the outgoing request and optionally buffer it
         const pump = async () => {
           try {
             while (true) {
               const { done, value } = await reader.read();
               if (done) {
                 await writer.close();
-                chunksComplete = true; // Mark chunks as complete
+                chunksComplete = true;
                 break;
               }
 
-              // Store chunk for potential retry
               chunks!.push(value);
 
-              // Write to the outgoing stream
               await writer.write(value);
             }
           } catch (error) {
             await writer.abort(error);
-            pumpError = error as Error; // Store the error
-            chunksComplete = true; // Mark as complete even on error
+            pumpError = error as Error;
+            chunksComplete = true;
             throw error;
           }
         };
 
-        // Start pumping the stream asynchronously - don't wait for it
         pump().catch((error) => {
           console.error("Error pumping request body:", error);
         });
 
-        // Set the readable stream as the body for the fetch request
         body = readable;
       }
     }
 
-    const apiKey = await getApiKey(currentToken.access_token);
-
-    if (!apiKey) {
-      return new Response("Failed to get API key", { status: 500 });
+    let apiKey: string;
+    try {
+      apiKey = await getApiKey(currentToken.access_token);
+    } catch (error) {
+      if (error instanceof Error) {
+        return new Response(`Failed to get API key: ${error.message}`, {
+          status: 500,
+        });
+      } else {
+        return new Response("Failed to get API key", { status: 500 });
+      }
     }
 
     const targetUrl = `https://${WATERFALL_API_HOSTNAME}${url.pathname}${url.search}`;
 
-    // Clone headers and modify them
     const headers = new Headers(req.headers);
     headers.set("authorization", `Bearer ${apiKey}`);
     headers.set("host", WATERFALL_API_HOSTNAME);
 
-    // Create request with all configuration upfront
     const response = await fetch(targetUrl, {
       method: req.method,
       headers: headers,
@@ -704,12 +736,10 @@ async function handleApiProxy(
       console.error(
         `API request ${url.pathname}${url.search} failed: ${response.status} ${response.statusText}`
       );
-      return new Response("API request failed", { status: 500 });
     }
 
     const responseType = response.headers.get("content-type");
     if (responseType && responseType.includes("text/event-stream")) {
-      // Stream the response body instead of buffering
       return new Response(response.body, {
         status: response.status,
         statusText: response.statusText,
@@ -720,27 +750,21 @@ async function handleApiProxy(
         },
       });
     } else if (responseType && responseType.includes("application/json")) {
-      // Parse the response body as JSON
       const data = await response.json();
       if (data && data.status != 200) {
         if (data.status == 434 && !isRetry) {
-          // Token expired, refresh and retry once
           clearStoredApiKey();
-          // Assemble buffer only when we need to retry
           let bufferedBody: ArrayBuffer | null = null;
           if (chunks) {
-            // If chunks aren't complete, it means there was an error during streaming
             if (!chunksComplete) {
               return new Response("Request body not fully received", {
                 status: 500,
               });
             }
 
-            // Check if pump encountered an error
             if (pumpError) {
               throw pumpError;
             }
-            // Convert chunks to a single ArrayBuffer
             const totalLength = chunks.reduce(
               (acc, chunk) => acc + chunk.length,
               0
@@ -753,14 +777,23 @@ async function handleApiProxy(
             }
             bufferedBody = combinedBuffer.buffer;
           }
-          // Retry by calling the handler again with isRetry=true and the buffered body
           return await handleApiProxy(req, url, true, bufferedBody);
         } else {
-          // Other error or already retried, return as-is
           console.error("API request error:", data);
+          let statusText = "API request error";
+          if (
+            data &&
+            typeof data === "object" &&
+            "status" in data &&
+            "msg" in data
+          ) {
+            statusText = `[${data.status}] ${data.msg}`;
+          } else if (data && typeof data === "object" && "msg" in data) {
+            statusText = data.msg;
+          }
           return new Response(JSON.stringify(data), {
             status: 500,
-            statusText: "API request error: " + data.msg || "Unknown",
+            statusText: statusText,
             headers: {
               "Access-Control-Allow-Origin": "*",
               "Access-Control-Allow-Headers":
@@ -782,8 +815,6 @@ async function handleApiProxy(
         },
       });
     } else {
-      // For non-stream responses, we need to handle them properly to avoid memory issues
-      // Use stream piping to avoid buffering large responses in memory
       const responseHeaders = new Headers(response.headers);
       responseHeaders.set("Access-Control-Allow-Origin", "*");
       responseHeaders.set(
