@@ -229,11 +229,14 @@ async function refreshToken() {
 
 let retryCount = 0;
 
+// If the token expires within 24 hours, refresh it
+const TOKEN_EXPIRE_MARGIN = 24 * 60 * 60 * 1000;
+
 // Function to check and validate existing token on startup
 async function checkExistingToken() {
   const currentToken = getCurrentToken();
   if (currentToken) {
-    if (Date.now() > currentToken.expiry_date - 5 * 60 * 60 * 1000) {
+    if (Date.now() > currentToken.expiry_date - TOKEN_EXPIRE_MARGIN) {
       // token expired
       try {
         if (await refreshToken()) {
@@ -270,7 +273,7 @@ const refreshTokenRoutine = async () => {
   const currentToken = getCurrentToken();
   if (
     currentToken &&
-    Date.now() > currentToken.expiry_date - 5 * 60 * 60 * 1000
+    Date.now() > currentToken.expiry_date - TOKEN_EXPIRE_MARGIN
   ) {
     try {
       if (await refreshToken()) {
