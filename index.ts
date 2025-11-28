@@ -202,14 +202,14 @@ async function refreshToken() {
 
   const data = await response.json();
 
+  console.log("Refresh response data:");
+  console.log(JSON.stringify(data));
+
   if (data && typeof data === "object" && "code" in data) {
     if (data.code != 200) {
       throw new Error(`WEB_ERROR ${data.code}: ${data.message || "UNKNOWN"}`);
     }
   }
-
-  console.log("Refresh response data:");
-  console.log(JSON.stringify(data));
 
   if (!data || !data.access_token || !data.refresh_token || !data.expires_in) {
     throw new Error("Invalid token response: missing required fields");
@@ -244,11 +244,11 @@ async function checkExistingToken() {
         } else {
           console.log("Token refresh failed, user needs to re-authenticate");
         }
-      } catch (error) {
+      } catch (error: any) {
         console.error(
           "Token refresh failed, assuming user is still authenticated but will retry next time"
         );
-        console.error(error);
+        console.error(error?.message || String(error));
         return false;
       }
     } else {
@@ -283,7 +283,7 @@ const refreshTokenRoutine = async () => {
         console.log("Token refresh failed, user needs to re-authenticate");
         retryCount = 0;
       }
-    } catch (error) {
+    } catch (error: any) {
       retryCount++;
       if (retryCount > 3) {
         console.error(
@@ -295,6 +295,7 @@ const refreshTokenRoutine = async () => {
       }
 
       console.log("Token refresh failed, will retry in 10 minutes");
+      console.error(error?.message || String(error));
       setTimeout(refreshTokenRoutine, TOKEN_RETRY_INTERVAL);
     }
   }
