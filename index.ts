@@ -757,7 +757,7 @@ async function handleApiProxy(
       });
     } else if (responseType && responseType.includes("application/json")) {
       const data = await response.json();
-      if (data && data.status != 200) {
+      if (data && data.status && data.status != 200) {
         if (data.status == 434 && !isRetry) {
           clearStoredApiKey();
           let bufferedBody: ArrayBuffer | null = null;
