@@ -64,6 +64,10 @@ const WATERFALL_LIST = atob(
   "aHR0cHM6Ly9pZmxvdy5jbi9hcGkvcGxhdGZvcm0vbW9kZWxzL2xpc3Q"
 );
 
+const WATERFALL_AUTHORIZE_PATH = atob(
+  "aHR0cHM6Ly9pZmxvdy5jbi9vYXV0aC9hdXRob3JpemU"
+);
+
 // Create table for key-value storage
 db.run(`
   CREATE TABLE IF NOT EXISTS kv (
@@ -73,32 +77,40 @@ db.run(`
 `);
 
 // Prepare statements for performance
-const getTokenStmt = db.prepare("SELECT value FROM kv WHERE key = 'token'");
-const saveTokenStmt = db.prepare(
+const getKvStmt = db.prepare<{ value: string }, [string]>(
+  "SELECT value FROM kv WHERE key = ?"
+);
+const saveKvStmt = db.prepare<{}, [string, string]>(
   "INSERT OR REPLACE INTO kv (key, value) VALUES (?, ?)"
 );
-const getApiKeyStmt = db.prepare("SELECT value FROM kv WHERE key = 'apiKey'");
 
-interface TokenData {
+type TokenData = Token & (TokenDataOAuth | TokenDataUid);
+
+interface Token {
   access_token: string;
-  refresh_token: string;
   expiry_date: number;
-  token_type: string;
-  scope: string;
+}
+
+interface TokenDataUid {
+  type: "uid";
+  uid: string;
+}
+
+interface TokenDataOAuth {
+  type: "oauth";
+  refresh_token: string;
 }
 
 // Function to get current token
 function getCurrentToken(): TokenData | null {
   try {
-    const result = getTokenStmt.get();
+    const result = getKvStmt.get("token");
     if (result && typeof result === "object" && "value" in result) {
       const tokenData = JSON.parse(result.value as string);
       if (
         tokenData &&
         typeof tokenData === "object" &&
-        tokenData.access_token &&
-        tokenData.refresh_token &&
-        typeof tokenData.expiry_date === "number"
+        tokenData.access_token
       ) {
         return tokenData;
       }
@@ -112,7 +124,7 @@ function getCurrentToken(): TokenData | null {
 // Function to save token
 function saveToken(token: TokenData) {
   const tokenJson = JSON.stringify(token);
-  saveTokenStmt.run("token", tokenJson);
+  saveKvStmt.run("token", tokenJson);
 }
 
 // Function to get API key
@@ -148,7 +160,7 @@ async function getApiKey(accessToken: string): Promise<string> {
 // Function to get stored API key
 function getStoredApiKey(): string | null {
   try {
-    const result = getApiKeyStmt.get();
+    const result = getKvStmt.get("apiKey");
     if (result && typeof result === "object" && "value" in result) {
       return result.value as string;
     }
@@ -166,11 +178,12 @@ function clearStoredApiKey() {
 function clearAuthData() {
   db.run(`DELETE FROM kv WHERE key = 'token'`);
   db.run(`DELETE FROM kv WHERE key = 'apiKey'`);
+  db.run(`DELETE FROM kv WHERE key = 'uid'`);
 }
 
 // Function to save API key
 function saveApiKey(apiKey: string) {
-  saveTokenStmt.run("apiKey", apiKey);
+  saveKvStmt.run("apiKey", apiKey);
 }
 
 // Function to refresh token
@@ -178,53 +191,124 @@ async function refreshToken() {
   const currentToken = getCurrentToken();
   if (!currentToken) return false;
 
-  const response = await fetch(WATERFALL_TOKEN, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/x-www-form-urlencoded",
-      Authorization: `Basic ${Buffer.from(
-        `${DECODED_CLIENT_ID}:${DECODED_CLIENT_SECRET}`
-      ).toString("base64")}`,
-    },
-    body: new URLSearchParams({
-      grant_type: "refresh_token",
-      refresh_token: currentToken.refresh_token,
-      client_id: DECODED_CLIENT_ID,
-      client_secret: DECODED_CLIENT_SECRET,
-    }).toString(),
-  });
+  if (currentToken.type == "oauth") {
+    const response = await fetch(WATERFALL_TOKEN, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${Buffer.from(
+          `${DECODED_CLIENT_ID}:${DECODED_CLIENT_SECRET}`
+        ).toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "refresh_token",
+        refresh_token: currentToken.refresh_token,
+        client_id: DECODED_CLIENT_ID,
+        client_secret: DECODED_CLIENT_SECRET,
+      }).toString(),
+    });
 
-  console.log(`Refresh response: ${response.status} ${response.statusText}`);
+    console.log(`Refresh response: ${response.status} ${response.statusText}`);
 
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status}: ${response.statusText}`);
-  }
-
-  const data = await response.json();
-
-  console.log("Refresh response data:");
-  console.log(JSON.stringify(data));
-
-  if (data && typeof data === "object" && "code" in data) {
-    if (data.code != 200) {
-      throw new Error(`WEB_ERROR ${data.code}: ${data.message || "UNKNOWN"}`);
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status}: ${response.statusText}`);
     }
+
+    const data = await response.json();
+
+    console.log("Refresh response data:");
+    console.log(JSON.stringify(data));
+
+    if (data && typeof data === "object" && "code" in data) {
+      if (data.code != 200) {
+        throw new Error(`WEB_ERROR ${data.code}: ${data.message || "UNKNOWN"}`);
+      }
+    }
+
+    if (
+      !data ||
+      !data.access_token ||
+      !data.refresh_token ||
+      !data.expires_in
+    ) {
+      throw new Error("Invalid token response: missing required fields");
+    }
+
+    const newToken: TokenData = {
+      type: "oauth",
+      access_token: data.access_token,
+      refresh_token: data.refresh_token,
+      expiry_date: Date.now() + data.expires_in * 1000,
+    };
+
+    saveToken(newToken);
+    return true;
   }
 
-  if (!data || !data.access_token || !data.refresh_token || !data.expires_in) {
-    throw new Error("Invalid token response: missing required fields");
+  if (currentToken.type == "uid") {
+    const uid = currentToken.uid;
+
+    const url = new URL(WATERFALL_AUTHORIZE_PATH);
+    const state = crypto
+      .getRandomValues(new Uint8Array(32))
+      .reduce((acc, byte) => acc + byte.toString(16).padStart(2, "0"), "");
+    url.searchParams.append("response_type", "code");
+    url.searchParams.append("client_id", DECODED_CLIENT_ID);
+    url.searchParams.append(
+      "redirect_uri",
+      `http://localhost:${PORT}${WATERFALL_CB_PATH}`
+    );
+    url.searchParams.append("uid", uid);
+    url.searchParams.append("state", state);
+
+    const authorize = await fetch(url, {
+      redirect: "manual",
+    });
+
+    const location = authorize.headers.get("location");
+    if (!location) {
+      throw new Error("UID: No location header");
+    }
+
+    const decode = new URL(location);
+    const code = decode.searchParams.get("code");
+    const receivedState = decode.searchParams.get("state");
+    if (state !== receivedState) {
+      throw new Error("UID: State mismatch");
+    }
+
+    if (!code) {
+      throw new Error("UID: No code");
+    }
+
+    const response = await fetch(WATERFALL_TOKEN, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${Buffer.from(
+          `${DECODED_CLIENT_ID}:${DECODED_CLIENT_SECRET}`
+        ).toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code,
+        redirect_uri: `http://localhost:${PORT}${WATERFALL_CB_PATH}`,
+        client_id: DECODED_CLIENT_ID,
+        client_secret: DECODED_CLIENT_SECRET,
+      }).toString(),
+    });
+
+    const data = await response.json();
+    const token: TokenData = {
+      type: "uid",
+      access_token: data.access_token,
+      uid,
+      expiry_date: Date.now() + data.expires_in * 1000,
+    };
+
+    saveToken(token);
+    return true;
   }
-
-  const newToken: TokenData = {
-    access_token: data.access_token,
-    refresh_token: data.refresh_token,
-    expiry_date: Date.now() + data.expires_in * 1000,
-    token_type: data.token_type,
-    scope: data.scope,
-  };
-
-  saveToken(newToken);
-  return true;
 }
 
 let retryCount = 0;
@@ -249,7 +333,7 @@ async function checkExistingToken() {
           "Token refresh failed, assuming user is still authenticated but will retry next time"
         );
         console.error(error?.message || String(error));
-        return false;
+        return true;
       }
     } else {
       console.log("Existing token is valid, user is authenticated");
@@ -257,7 +341,7 @@ async function checkExistingToken() {
   } else {
     console.log("No existing token, user need to authenticate");
   }
-  return true;
+  return false;
 }
 
 // Check existing token on startup
@@ -271,32 +355,33 @@ const TOKEN_RETRY_INTERVAL = 10 * 60 * 1000;
 
 const refreshTokenRoutine = async () => {
   const currentToken = getCurrentToken();
-  if (
-    currentToken &&
-    Date.now() > currentToken.expiry_date - TOKEN_EXPIRE_MARGIN
-  ) {
-    try {
-      if (await refreshToken()) {
-        console.log("Token refreshed successfully");
-        retryCount = 0;
-      } else {
-        console.log("Token refresh failed, user needs to re-authenticate");
-        retryCount = 0;
-      }
-    } catch (error: any) {
-      retryCount++;
-      if (retryCount > 3) {
-        console.error(
-          "Token refresh failed too many times, user needs to re-authenticate"
-        );
-        clearAuthData();
-        retryCount = 0;
-        return false;
-      }
+  if (currentToken) {
+    if (currentToken.type == "oauth") {
+      if (Date.now() > currentToken.expiry_date - TOKEN_EXPIRE_MARGIN) {
+        try {
+          if (await refreshToken()) {
+            console.log("Token refreshed successfully");
+            retryCount = 0;
+          } else {
+            console.log("Token refresh failed, user needs to re-authenticate");
+            retryCount = 0;
+          }
+        } catch (error: any) {
+          retryCount++;
+          if (retryCount > 3) {
+            console.error(
+              "Token refresh failed too many times, user needs to re-authenticate"
+            );
+            clearAuthData();
+            retryCount = 0;
+            return false;
+          }
 
-      console.log("Token refresh failed, will retry in 10 minutes");
-      console.error(error?.message || String(error));
-      setTimeout(refreshTokenRoutine, TOKEN_RETRY_INTERVAL);
+          console.log("Token refresh failed, will retry in 10 minutes");
+          console.error(error?.message || String(error));
+          setTimeout(refreshTokenRoutine, TOKEN_RETRY_INTERVAL);
+        }
+      }
     }
   }
 
@@ -318,7 +403,8 @@ let PENDING_STATE: string | null = null;
 
 // Function to handle root route
 async function handleRoot(): Promise<Response> {
-  if (!getCurrentToken()) {
+  const currentToken = getCurrentToken();
+  if (!currentToken) {
     PENDING_STATE = crypto
       .getRandomValues(new Uint8Array(32))
       .reduce((acc, byte) => acc + byte.toString(16).padStart(2, "0"), "");
@@ -357,7 +443,7 @@ async function handleRoot(): Promise<Response> {
             color: #333;
             margin-bottom: 1.5rem;
           }
-          .login-btn {
+          .login-btn, .uid-btn {
             display: inline-block;
             background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
@@ -367,10 +453,56 @@ async function handleRoot(): Promise<Response> {
             font-weight: bold;
             transition: transform 0.2s, box-shadow 0.2s;
             box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            border: none;
+            cursor: pointer;
+            font-size: 16px;
+            margin: 5px;
           }
-          .login-btn:hover {
+          .login-btn:hover, .uid-btn:hover {
             transform: translateY(-2px);
             box-shadow: 0 6px 20px rgba(0,0,0,0.25);
+          }
+          .divider {
+            margin: 1.5rem 0;
+            text-align: center;
+            position: relative;
+          }
+          .divider::before {
+            content: '';
+            position: absolute;
+            top: 50%;
+            left: 0;
+            right: 0;
+            height: 1px;
+            background: #ddd;
+          }
+          .divider span {
+            background: white;
+            padding: 0 1rem;
+            color: #666;
+            position: relative;
+          }
+          .uid-form {
+            margin-top: 1rem;
+          }
+          .uid-input {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+            margin-bottom: 1rem;
+            font-size: 16px;
+            box-sizing: border-box;
+          }
+          .uid-input:focus {
+            outline: none;
+            border-color: #667eea;
+            box-shadow: 0 0 0 2px rgba(102, 126, 234, 0.2);
+          }
+          .error-message {
+            color: #e74c3c;
+            margin-top: 0.5rem;
+            font-size: 14px;
           }
         </style>
       </head>
@@ -378,7 +510,41 @@ async function handleRoot(): Promise<Response> {
         <div class="container">
           <h1>Login Portal</h1>
           <a href="${loginUrl}" class="login-btn">Click me</a>
+          <div class="divider">
+            <span>OR</span>
+          </div>
+          <form class="uid-form" action="/submit-uid" method="post">
+            <input type="text" name="uid" class="uid-input" placeholder="Enter your UID" required>
+            <button type="submit" class="uid-btn">Submit UID</button>
+          </form>
+          <div id="error-message" class="error-message"></div>
         </div>
+        <script>
+          document.querySelector('.uid-form').addEventListener('submit', async function(e) {
+            e.preventDefault();
+            const uid = document.querySelector('input[name="uid"]').value;
+            const errorDiv = document.getElementById('error-message');
+            
+            try {
+              const response = await fetch('/submit-uid', {
+                method: 'POST',
+                headers: {
+                  'Content-Type': 'application/x-www-form-urlencoded',
+                },
+                body: 'uid=' + encodeURIComponent(uid)
+              });
+              
+              if (response.ok) {
+                window.location.reload();
+              } else {
+                const data = await response.text();
+                errorDiv.textContent = data || 'Invalid UID';
+              }
+            } catch (error) {
+              errorDiv.textContent = 'Network error. Please try again.';
+            }
+          });
+        </script>
       </body>
       </html>
     `,
@@ -444,7 +610,7 @@ async function handleRoot(): Promise<Response> {
       <body>
         <div class="container">
           <h1>Welcome</h1>
-          <p>You have successfully authenticated! You can now access the API via "http://localhost:${PORT}/v1".</p>
+          <p>You have successfully authenticated using <strong>${currentToken.type}</strong>! You can now access the API via "http://localhost:${PORT}/v1".</p>
           <form action="/logout" method="post">
             <button type="submit" class="logout-btn">Logout</button>
           </form>
@@ -497,11 +663,10 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
 
     const data = await response.json();
     const token: TokenData = {
+      type: "oauth",
       access_token: data.access_token,
       refresh_token: data.refresh_token,
       expiry_date: Date.now() + data.expires_in * 1000,
-      token_type: data.token_type,
-      scope: data.scope,
     };
 
     saveToken(token);
@@ -584,6 +749,104 @@ async function handleLogout(): Promise<Response> {
       Location: "/",
     },
   });
+}
+
+// Function to handle UID submission
+async function handleUidSubmission(req: Request): Promise<Response> {
+  try {
+    const formData = await req.formData();
+    const uid = formData.get("uid") as string;
+
+    if (!uid || uid.trim() === "") {
+      return new Response("UID cannot be empty", { status: 400 });
+    }
+
+    const url = new URL(WATERFALL_AUTHORIZE_PATH);
+    const state = crypto
+      .getRandomValues(new Uint8Array(32))
+      .reduce((acc, byte) => acc + byte.toString(16).padStart(2, "0"), "");
+    url.searchParams.append("response_type", "code");
+    url.searchParams.append("client_id", DECODED_CLIENT_ID);
+    url.searchParams.append(
+      "redirect_uri",
+      `http://localhost:${PORT}${WATERFALL_CB_PATH}`
+    );
+    url.searchParams.append("uid", uid);
+    url.searchParams.append("state", state);
+
+    const authorize = await fetch(url, {
+      redirect: "manual",
+    });
+
+    const location = authorize.headers.get("location");
+    if (!location) {
+      console.error("Error handling UID submission: no location");
+      return new Response("Invalid UID", { status: 500 });
+    }
+
+    const decode = new URL(location);
+    const code = decode.searchParams.get("code");
+    const receivedState = decode.searchParams.get("state");
+    if (state !== receivedState) {
+      console.error("Error handling UID submission: invalid state");
+      return new Response("Invalid state", { status: 500 });
+    }
+
+    if (!code) {
+      return new Response("No code provided", { status: 500 });
+    }
+
+    const response = await fetch(WATERFALL_TOKEN, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        Authorization: `Basic ${Buffer.from(
+          `${DECODED_CLIENT_ID}:${DECODED_CLIENT_SECRET}`
+        ).toString("base64")}`,
+      },
+      body: new URLSearchParams({
+        grant_type: "authorization_code",
+        code: code,
+        redirect_uri: `http://localhost:${PORT}${WATERFALL_CB_PATH}`,
+        client_id: DECODED_CLIENT_ID,
+        client_secret: DECODED_CLIENT_SECRET,
+      }).toString(),
+    });
+
+    const data = await response.json();
+    const token: TokenData = {
+      type: "uid",
+      access_token: data.access_token,
+      uid,
+      expiry_date: Date.now() + data.expires_in * 1000,
+    };
+
+    saveToken(token);
+
+    // try getting uid once. if it fails, then the login has failed
+    try {
+      await getApiKey(token.access_token);
+    } catch (error) {
+      clearAuthData();
+      if (error instanceof Error) {
+        return new Response(`Failed to get API key: ${error.message}`, {
+          status: 500,
+        });
+      } else {
+        return new Response("Failed to get API key", { status: 500 });
+      }
+    }
+
+    return new Response(null, {
+      status: 302,
+      headers: {
+        Location: "/",
+      },
+    });
+  } catch (error) {
+    console.error("Error handling UID submission:", error);
+    return new Response("Internal server error", { status: 500 });
+  }
 }
 
 // Function to handle models list
@@ -858,6 +1121,10 @@ const server = Bun.serve({
 
     if (url.pathname === "/logout" && req.method === "POST") {
       return await handleLogout();
+    }
+
+    if (url.pathname === "/submit-uid" && req.method === "POST") {
+      return await handleUidSubmission(req);
     }
 
     if (url.pathname.startsWith("/v1")) {
