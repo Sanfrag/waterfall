@@ -1,6 +1,11 @@
 import { Database } from "bun:sqlite";
 import { CLIENT_ID, CLIENT_SECRET } from "./config";
 
+let PORT = parseInt(process.env.PORT || "34007");
+if (isNaN(PORT)) {
+  PORT = 34007;
+}
+
 // Helper functions to decode base64 values
 const decodeBase64 = (value: string): string => {
   return Buffer.from(value, "base64").toString("utf-8");
@@ -342,11 +347,6 @@ setTimeout(
   refreshTokenRoutine,
   needRetry ? TOKEN_RETRY_INTERVAL : TOKEN_REFRESH_INTERVAL
 );
-
-let PORT = parseInt(process.env.PORT || "34007");
-if (isNaN(PORT)) {
-  PORT = 34007;
-}
 
 let PENDING_STATE: string | null = null;
 
