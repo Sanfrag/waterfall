@@ -127,7 +127,7 @@ async function getApiKey(accessToken: string): Promise<{
   uid: string;
 }> {
   const storedApiKey = getStoredApiKey();
-  if (storedApiKey) {
+  if (storedApiKey && storedApiKey.uid) {
     return storedApiKey;
   }
 
@@ -153,7 +153,7 @@ async function getApiKey(accessToken: string): Promise<{
   if (!uid) {
     throw new Error("User ID not found in response");
   }
-
+  
   const result = {
     apiKey,
     uid,
@@ -255,9 +255,12 @@ async function refreshToken() {
   });
 
   const data = await response.json();
+  clearStoredApiKey();
+
+  const keys = await getApiKey(data.access_token);
   const token: TokenData = {
     access_token: data.access_token,
-    uid,
+    uid: keys.uid,
     expiry_date: Date.now() + data.expires_in * 1000,
   };
 
@@ -542,6 +545,7 @@ async function handleOAuthCallback(url: URL): Promise<Response> {
       return new Response("Invalid token response", { status: 500 });
     }
 
+    clearStoredApiKey();
     const keys = await getApiKey(data.access_token);
 
     const token: TokenData = {
