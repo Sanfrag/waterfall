@@ -168,7 +168,7 @@
               runHook preBuild
 
               mkdir -p dist
-              bun build index.ts --minify --sourcemap --target bun --outfile dist/index.js
+              bun build index.ts --minify --target bun --outfile dist/index.js
 
               runHook postBuild
             '';
