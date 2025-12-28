@@ -129,18 +129,21 @@
 
             nativeBuildInputs = [ pkgs.bun ];
 
-            # Install the service files
-            installPhase = ''
-              mkdir -p $out/lib/waterfall
-              cp -r index.ts config.ts package.json bun.lock $out/lib/waterfall/
+            # Install dependencies and build the project
+            buildPhase = ''
+              # Install dependencies
+              bun install --frozen-lockfile
+              
+              # Build the project targeting bun
+              bun build index.ts --compile --minify --bytecode --outfile waterfall
+            '';
 
-              # Create a wrapper script
+            # Install the built script
+            installPhase = ''
               mkdir -p $out/bin
-              cat > $out/bin/waterfall << EOF
-              #!${pkgs.runtimeShell}
-              cd $out/lib/waterfall
-              exec ${pkgs.bun}/bin/bun index.ts "\$@"
-              EOF
+              
+              # Copy the compiled binary
+              cp waterfall $out/bin/waterfall
               chmod +x $out/bin/waterfall
             '';
 
