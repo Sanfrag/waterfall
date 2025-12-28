@@ -1,16 +1,18 @@
 import { Database } from "bun:sqlite";
 import { CLIENT_ID, CLIENT_SECRET } from "./config";
 import { parseHTML } from "linkedom";
-import { Defuddle } from "defuddle/node";
 import { mkdirSync, accessSync, constants, existsSync, unlinkSync } from "fs";
 import { dirname } from "path";
+import { Readability } from "@mozilla/readability";
+import TurndownService from "turndown";
+
+const turndown = new TurndownService();
+let PORT = parseInt(process.env.PORT || "34007");
+if (isNaN(PORT)) {
+  PORT = 34007;
+}
 
 (async () => {
-  let PORT = parseInt(process.env.PORT || "34007");
-  if (isNaN(PORT)) {
-    PORT = 34007;
-  }
-
   // Helper functions to decode base64 values
   const decodeBase64 = (value: string): string => {
     return Buffer.from(value, "base64").toString("utf-8");
@@ -988,14 +990,14 @@ import { dirname } from "path";
       });
 
       if (!response.ok) {
-        throw new Error(`Failed to download: ${response.statusText}`);
+        return `ERROR: Failed to download: ${response.status} ${response.statusText}`;
       }
       const content = await response.text();
       return content;
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : String(error);
-      return `Error downloading URL: ${errorMessage}`;
+      return `ERROR: Error downloading URL: ${errorMessage}`;
     }
   }
 
@@ -1016,7 +1018,6 @@ import { dirname } from "path";
 
       // Get the HTML content
       const html = await response.text();
-      const startTime = Date.now();
       const dom = parseHTML(html);
       // remove all iframes
       const iframes = dom.document.querySelectorAll("iframe");
@@ -1033,26 +1034,19 @@ import { dirname } from "path";
       for (const dataURI of dataURIs) {
         dataURI.setAttribute("src", "");
       }
-      const article = await Defuddle(dom as any, args.url, {
-        markdown: true,
-      });
-      return JSON.stringify({
-        content: [
-          {
-            type: "text",
-            text: article.content,
-          },
-        ],
-      });
+      const article = new Readability(dom.document).parse();
+
+      if (!article) {
+        return `ERROR: Failed to read article`;
+      }
+
+      return `${article.title ? "Title: " + article.title : ""}\n${
+        article.byline ? "By: " + article.byline : ""
+      }\n${article.content ? turndown.turndown(article.content) : ""}`;
     } catch (error) {
       const errorMessage =
         error instanceof Error ? error.message : "Unknown error occurred";
-      return JSON.stringify({
-        content: [
-          { type: "text", text: `Error fetching URL: ${errorMessage}` },
-        ],
-        isError: true,
-      });
+      return `ERROR: Error reading content: ${errorMessage}`;
     }
   }
 

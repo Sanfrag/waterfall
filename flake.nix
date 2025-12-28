@@ -119,32 +119,76 @@
         system:
         let
           pkgs = import nixpkgs { inherit system; };
+
+          # Create a Fixed Output Derivation for node_modules
+          nodeModules = pkgs.stdenv.mkDerivation {
+            pname = "waterfall-node_modules";
+            version = "1.0.3";
+            impureEnvVars = pkgs.lib.fetchers.proxyImpureEnvVars ++ [
+              "GIT_PROXY_COMMAND"
+              "SOCKS_SERVER"
+            ];
+            src = ./.;
+            nativeBuildInputs = [ pkgs.bun ];
+            dontConfigure = true;
+            buildPhase = ''
+              bun install --no-progress --frozen-lockfile --no-cache
+              bun pm cache rm
+            '';
+            installPhase = ''
+              mkdir -p $out/node_modules
+              cp -R ./node_modules/. $out/node_modules/
+            '';
+            outputHash = "sha256-OOPJFInzwian73OsaauDlGO3LTAEAuAidKj+REeEFA8=";
+            outputHashAlgo = "sha256";
+            outputHashMode = "recursive";
+          };
         in
         {
           waterfall = pkgs.stdenv.mkDerivation {
             pname = "waterfall";
-            version = "1.0.2";
+            version = "1.0.3";
 
             src = ./.;
 
             nativeBuildInputs = [ pkgs.bun ];
 
-            # Install dependencies and build the project
+            configurePhase = ''
+              runHook preConfigure
+
+              # Copy node_modules from FOD
+              mkdir -p node_modules
+              cp -R ${nodeModules}/node_modules/. ./node_modules/
+
+              runHook postConfigure
+            '';
+
+            # Build the project targeting bun
             buildPhase = ''
-              # Install dependencies
-              bun install --frozen-lockfile
-              
-              # Build the project targeting bun
-              bun build index.ts --compile --minify --bytecode --outfile waterfall
+              runHook preBuild
+
+              mkdir -p dist
+              bun build index.ts --minify --sourcemap --target bun --outfile dist/index.js
+
+              runHook postBuild
             '';
 
             # Install the built script
             installPhase = ''
+              runHook preInstall
+
+              mkdir -p $out/lib/waterfall
+              cp dist/index.js $out/lib/waterfall/index.js
+
+              # Create a wrapper script
               mkdir -p $out/bin
-              
-              # Copy the compiled binary
-              cp waterfall $out/bin/waterfall
+              cat > $out/bin/waterfall << EOF
+              #!${pkgs.runtimeShell}
+              cd $out/lib/waterfall
+              exec ${pkgs.bun}/bin/bun index.js "\$@"
+              EOF
               chmod +x $out/bin/waterfall
+              runHook postInstall
             '';
 
             meta = {

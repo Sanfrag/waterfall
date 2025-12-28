@@ -1,7 +1,9 @@
 {
   "devDependencies": {
+    "@mozilla/readability": "^0.6.0",
     "@types/bun": "^1.3.5",
-    "defuddle": "^0.6.6",
-    "linkedom": "^0.18.12"
+    "@types/turndown": "^5.0.6",
+    "linkedom": "^0.18.12",
+    "turndown": "^7.2.2"
   }
 }
