@@ -125,7 +125,7 @@
         {
           waterfall = pkgs.stdenv.mkDerivation {
             pname = "waterfall";
-            version = "1.0.4";
+            version = "1.0.15";
 
             src = ./.;
 
